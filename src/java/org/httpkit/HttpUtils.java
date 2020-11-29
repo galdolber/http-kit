@@ -1,6 +1,7 @@
 package org.httpkit;
 
 import clojure.lang.ISeq;
+import clojure.lang.PersistentList;
 import clojure.lang.Seqable;
 
 import java.io.*;
@@ -84,6 +85,11 @@ public class HttpUtils {
     // space ' '
     public static final byte SP = 32;
 
+    public static final String EXPECT = "expect";
+
+    public static final String CONTINUE = "100-continue";
+
+
     public static ByteBuffer bodyBuffer(Object body) throws IOException {
         if (body == null) {
             return null;
@@ -93,17 +99,26 @@ public class HttpUtils {
         } else if (body instanceof InputStream) {
             DynamicBytes b = readAll((InputStream) body);
             return ByteBuffer.wrap(b.get(), 0, b.length());
+        } else if (body instanceof byte[]) {
+            return ByteBuffer.wrap((byte[]) body);
         } else if (body instanceof File) {
             // serving file is better be done by Nginx
             return readAll((File) body);
         } else if (body instanceof Seqable) {
             ISeq seq = ((Seqable) body).seq();
-            DynamicBytes b = new DynamicBytes(seq.count() * 512);
-            while (seq != null) {
-                b.append(seq.first().toString(), UTF_8);
-                seq = seq.next();
+            if (seq == null) {
+                return null;
+            } else {
+                DynamicBytes b = new DynamicBytes(seq.count() * 512);
+                while (seq != null) {
+                    b.append(seq.first().toString(), UTF_8);
+                    seq = seq.next();
+                }
+                return ByteBuffer.wrap(b.get(), 0, b.length());
             }
-            return ByteBuffer.wrap(b.get(), 0, b.length());
+        // makes ultimate optimization possible: no copy
+        } else if (body instanceof ByteBuffer) {
+            return (ByteBuffer) body;
         } else {
             throw new RuntimeException(body.getClass() + " is not understandable");
         }
@@ -124,7 +139,8 @@ public class HttpUtils {
             } else {
                 switch (c) {
                     case '"':
-                    case '%':
+                        // https://github.com/http-kit/http-kit/issues/70
+//                    case '%':
                     case '<':
                     case '>':
                     case '\\':
@@ -150,9 +166,9 @@ public class HttpUtils {
         return new String(buffer.get(), 0, buffer.length(), UTF_8);
     }
 
-    public static int findEndOfString(String sb) {
+    public static int findEndOfString(String sb, int offset) {
         int result;
-        for (result = sb.length(); result > 0; result--) {
+        for (result = sb.length(); result > offset; result--) {
             if (!isWhitespace(sb.charAt(result - 1))) {
                 break;
             }
@@ -213,7 +229,7 @@ public class HttpUtils {
     }
 
     public static String getPath(URI uri) {
-        String path = encodeURI(uri.getPath());
+        String path = encodeURI(uri.getRawPath());
         String query = uri.getRawQuery();
         if ("".equals(path))
             path = "/";
@@ -244,6 +260,14 @@ public class HttpUtils {
         return host;
     }
 
+    public static String getProxyHost(URI uri){
+        if (uri.getPort() == -1){
+            return uri.getHost();
+        }
+
+        return uri.getHost() + ":" + uri.getPort();
+    }
+
     public static InetSocketAddress getServerAddr(URI uri) throws UnknownHostException {
         InetAddress host = getByName(uri.getHost());
         return new InetSocketAddress(host, getPort(uri));
@@ -271,7 +295,7 @@ public class HttpUtils {
 
     public static ByteBuffer readAll(File f) throws IOException {
         int length = (int) f.length();
-        if (length >= 1024 * 1024 * 2) { // 2M
+        if (length >= 1024 * 1024 * 20) { // 20M
             FileInputStream fs = new FileInputStream(f);
             MappedByteBuffer buffer = fs.getChannel().map(MapMode.READ_ONLY, 0, length);
             fs.close();
@@ -292,6 +316,14 @@ public class HttpUtils {
         return bytes;
     }
 
+    public static String getStringValue(Map<String, Object> headers, String key) {
+        Object o = headers.get(key);
+        if (o instanceof String) {
+            return (String) o;
+        }
+        return null;
+    }
+
     public static void printError(String msg, Throwable t) {
         String error = String.format("%s [%s] ERROR - %s", new Date(), Thread.currentThread()
                 .getName(), msg);
@@ -302,7 +334,7 @@ public class HttpUtils {
         System.err.print(str.getBuffer().toString());
     }
 
-    public static void splitAndAddHeader(String sb, Map<String, String> headers) {
+    public static void splitAndAddHeader(String sb, Map<String, Object> headers) {
         final int length = sb.length();
         int nameStart;
         int nameEnd;
@@ -326,14 +358,20 @@ public class HttpUtils {
         }
 
         valueStart = findNonWhitespace(sb, colonEnd);
-        valueEnd = findEndOfString(sb);
+        valueEnd = findEndOfString(sb, valueStart);
 
         String key = sb.substring(nameStart, nameEnd);
         if (valueStart > valueEnd) { // ignore
             // logger.warn("header error: " + sb);
         } else {
             String value = sb.substring(valueStart, valueEnd);
-            headers.put(key.toLowerCase(), value);
+            key = key.toLowerCase();
+            Object v = headers.get(key);
+            if (v != null) {
+                // https://github.com/http-kit/http-kit/issues/108
+                value = v.toString() + "," + value;
+            }
+            headers.put(key, value);
         }
     }
 
@@ -375,9 +413,9 @@ public class HttpUtils {
     }
 
     // unit test in utils-test.clj
-    public static Charset detectCharset(Map<String, String> headers, DynamicBytes body) {
+    public static Charset detectCharset(Map<String, Object> headers, DynamicBytes body) {
         // 1. first from http header: Content-Type: text/html; charset=utf8
-        Charset result = parseCharset(headers.get(CONTENT_TYPE));
+        Charset result = parseCharset(getStringValue(headers, CONTENT_TYPE));
         if (result == null) {
             // 2. decode a little to find charset=???
             String s = new String(body.get(), 0, min(512, body.length()), ASCII);
@@ -401,15 +439,20 @@ public class HttpUtils {
     public static final String CL = "Content-Length";
 
     public static ByteBuffer[] HttpEncode(int status, HeaderMap headers, Object body) {
+        return HttpEncode(status, headers, body, null);
+    }
+
+    public static ByteBuffer[] HttpEncode(int status, HeaderMap headers, Object body, String serverHeader) {
         ByteBuffer bodyBuffer;
         try {
             bodyBuffer = bodyBuffer(body);
             // only write length if not chunked
             if (!CHUNKED.equals(headers.get("Transfer-Encoding"))) {
                 if (bodyBuffer != null) {
-                    headers.put(CL, Integer.toString(bodyBuffer.remaining()));
+                    // trust the computed length
+                    headers.putOrReplace(CL, Integer.toString(bodyBuffer.remaining()));
                 } else {
-                    headers.put(CL, "0");
+                    headers.putOrReplace(CL, "0");
                 }
             }
         } catch (IOException e) {
@@ -419,9 +462,12 @@ public class HttpUtils {
             headers.put(CL, Integer.toString(b.length));
             bodyBuffer = ByteBuffer.wrap(b);
         }
-        headers.put("Server", "http-kit");
-        headers.put("Date", DateFormatter.getDate()); // rfc says the Date is needed
-
+        if (serverHeader != null && !headers.containsKey("Server")) {
+          headers.put("Server", serverHeader);
+        }
+        if (!headers.containsKey("Date")) {
+          headers.put("Date", DateFormatter.getDate()); // rfc says the Date is needed
+        }
         DynamicBytes bytes = new DynamicBytes(196);
         byte[] bs = HttpStatus.valueOf(status).getInitialLineBytes();
         bytes.append(bs, bs.length);

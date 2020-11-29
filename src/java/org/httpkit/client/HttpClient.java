@@ -2,6 +2,9 @@ package org.httpkit.client;
 
 import org.httpkit.*;
 import org.httpkit.ProtocolException;
+import org.httpkit.logger.ContextLogger;
+import org.httpkit.logger.EventNames;
+import org.httpkit.logger.EventLogger;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -13,6 +16,7 @@ import java.nio.channels.SelectionKey;
 import java.nio.channels.Selector;
 import java.nio.channels.SocketChannel;
 import java.security.NoSuchAlgorithmException;
+import java.security.KeyManagementException;
 import java.util.Iterator;
 import java.util.Queue;
 import java.util.Set;
@@ -26,51 +30,110 @@ import static org.httpkit.HttpUtils.getServerAddr;
 import static org.httpkit.client.State.ALL_READ;
 import static org.httpkit.client.State.READ_INITIAL;
 
-public final class HttpClient implements Runnable {
+public class HttpClient implements Runnable {
     private static final AtomicInteger ID = new AtomicInteger(0);
 
-    public static final SSLContext DEFAULT_CONTEXT;
+    private static SSLContext defaultContext = null;
 
-    static {
-        try {
-            DEFAULT_CONTEXT = SSLContext.getDefault();
-        } catch (NoSuchAlgorithmException e) {
-            throw new Error("Failed to initialize SSLContext", e);
-        }
-    }
-
+    // queue request, for only issue connection in the IO thread
     private final Queue<Request> pending = new ConcurrentLinkedQueue<Request>();
+    // ongoing requests, saved for timeout check
     private final PriorityQueue<Request> requests = new PriorityQueue<Request>();
+    // reuse TCP connection
     private final PriorityQueue<PersistentConn> keepalives = new PriorityQueue<PersistentConn>();
-
+    private final long maxConnections;
+    private volatile long numConnections = 0;
     private volatile boolean running = true;
 
     // shared, single thread
     private final ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 64);
     private final Selector selector;
 
+    private final ContextLogger<String, Throwable> errorLogger;
+    private final EventLogger<String> eventLogger;
+    private final EventNames eventNames;
+
+    public static interface AddressFinder {
+        public static final AddressFinder DEFAULT = new AddressFinder() {
+            public InetSocketAddress findAddress(URI uri) throws UnknownHostException {
+                return getServerAddr(uri);
+            }
+        };
+        InetSocketAddress findAddress(URI uri) throws UnknownHostException;
+    }
+
+    public static interface SSLEngineURIConfigurer {
+        public static final SSLEngineURIConfigurer NOP = new SSLEngineURIConfigurer() {
+            public void configure(SSLEngine sslEngine, URI uri) { /* do nothing */ }
+        };
+        void configure(SSLEngine sslEngine, URI uri);
+    }
+
+    private final AddressFinder addressFinder;
+    private final SSLEngineURIConfigurer sslEngineUriConfigurer;
+    private final SocketAddress bindAddress;
+
+    public static SSLContext getDefaultContext() {
+        if(defaultContext==null) {
+            try {
+                SSLContext sslContext = SSLContext.getInstance("TLS");
+                sslContext.init(null, TrustManagerFactory.getTrustManagers() ,null);
+                defaultContext = sslContext;
+            } catch (Exception e) {
+                throw new Error("Failed to initialize SSLContext", e);
+            }
+        }
+        return defaultContext;
+    }
+
     public HttpClient() throws IOException {
+        this(-1);
+    }
+
+
+    public HttpClient(long maxConnections, AddressFinder addressFinder, SSLEngineURIConfigurer sslEngineUriConfigurer,
+            ContextLogger<String, Throwable> errorLogger,
+            EventLogger<String> eventLogger, EventNames eventNames) throws IOException {
+      this(maxConnections, addressFinder, sslEngineUriConfigurer, errorLogger, eventLogger, eventNames, null);          
+    }
+
+    public HttpClient(long maxConnections, AddressFinder addressFinder, SSLEngineURIConfigurer sslEngineUriConfigurer,
+            ContextLogger<String, Throwable> errorLogger,
+            EventLogger<String> eventLogger, EventNames eventNames, SocketAddress bindAddress) throws IOException {
+        getDefaultContext();
+        this.addressFinder = addressFinder;
+        this.sslEngineUriConfigurer = sslEngineUriConfigurer;
+        this.errorLogger = errorLogger;
+        this.eventLogger = eventLogger;
+        this.eventNames = eventNames;
+        this.bindAddress = bindAddress;
+
         int id = ID.incrementAndGet();
         String name = "client-loop";
         if (id > 1) {
             name = name + "#" + id;
         }
+        this.maxConnections = maxConnections;
         selector = Selector.open();
         Thread t = new Thread(this, name);
         t.setDaemon(true);
         t.start();
     }
 
+    public HttpClient(long maxConnections) throws IOException {
+        this(maxConnections, AddressFinder.DEFAULT, SSLEngineURIConfigurer.NOP,
+                ContextLogger.ERROR_PRINTER, EventLogger.NOP, EventNames.DEFAULT);
+    }
+
     private void clearTimeout(long now) {
         Request r;
         while ((r = requests.peek()) != null) {
             if (r.isTimeout(now)) {
-                String msg = "connect timeout: ";
-                if (r.isConnected) {
-                    msg = "read timeout: ";
-                }
+                boolean connected = r.isConnected();
+                String msg = connected ? "idle timeout: " : "connect timeout: ";
+                long timeout = connected ? r.cfg.idleTimeout : r.cfg.connTimeout;
                 // will remove it from queue
-                r.finish(new TimeoutException(msg + r.cfg.timeout + "ms"));
+                r.finish(new TimeoutException(msg + timeout + "ms"));
                 if (r.key != null) {
                     closeQuietly(r.key);
                 }
@@ -150,10 +213,15 @@ public final class HttpClient implements Runnable {
             req.onProgress(now);
             buffer.flip();
             try {
+                State oldState = req.decoder.state;
                 if (req.decoder.decode(buffer) == ALL_READ) {
                     req.finish();
                     if (req.cfg.keepAlive > 0) {
-                        keepalives.offer(new PersistentConn(now + req.cfg.keepAlive, req.addr, key));
+                        // Ensure that the key is added to keepalives exactly once on a state transition. There could be cases where decoder reaches
+                        // ALL_READ state multiple times.
+                        if (oldState != ALL_READ) {
+                            keepalives.offer(new PersistentConn(now + req.cfg.keepAlive, req.addr, key));
+                        }
                     } else {
                         closeQuietly(key);
                     }
@@ -164,7 +232,8 @@ public final class HttpClient implements Runnable {
             } catch (Exception e) {
                 closeQuietly(key);
                 req.finish(e);
-                HttpUtils.printError("should not happen", e); // decoding
+                errorLogger.log("should not happen", e); // decoding
+                eventLogger.log(eventNames.clientImpossible);
             }
         }
     }
@@ -175,9 +244,11 @@ public final class HttpClient implements Runnable {
             key.channel().close();
         } catch (Exception ignore) {
         }
+        numConnections--;
     }
 
-    private void doWrite(SelectionKey key) {
+    private void doWrite(SelectionKey key, long now) {
+        // TODO [#327]: call `onProgress(now)` on write progress?
         Request req = (Request) key.attachment();
         SocketChannel ch = (SocketChannel) key.channel();
         try {
@@ -208,10 +279,15 @@ public final class HttpClient implements Runnable {
         }
     }
 
+
+
     public void exec(String url, RequestConfig cfg, SSLEngine engine, IRespListener cb) {
-        URI uri;
+        URI uri,proxyUri = null;
         try {
             uri = new URI(url);
+            if (cfg.proxy_url != null) {
+                proxyUri = new URI(cfg.proxy_url);
+            }
         } catch (URISyntaxException e) {
             cb.onThrowable(e);
             return;
@@ -231,7 +307,11 @@ public final class HttpClient implements Runnable {
 
         InetSocketAddress addr;
         try {
-            addr = getServerAddr(uri);
+            if (proxyUri == null) {
+                addr = addressFinder.findAddress(uri);
+            } else {
+                addr = addressFinder.findAddress(proxyUri);
+            }
         } catch (UnknownHostException e) {
             cb.onThrowable(e);
             return;
@@ -239,10 +319,14 @@ public final class HttpClient implements Runnable {
 
         // copy to modify, normalize header
         HeaderMap headers = HeaderMap.camelCase(cfg.headers);
-        headers.put("Host", HttpUtils.getHost(uri));
 
-        if (!headers.containsKey("Accept")) // allow override
-            headers.put("Accept", "*/*");
+        if (!headers.containsKey("Host")) // if caller set it explicitly, let he do it
+            headers.put("Host", HttpUtils.getHost(uri));
+        /**
+         * commented on 2014/3/18: Accept is not required
+         */
+//        if (!headers.containsKey("Accept")) // allow override
+//            headers.put("Accept", "*/*");
         if (!headers.containsKey("User-Agent")) // allow override
             headers.put("User-Agent", RequestConfig.DEFAULT_USER_AGENT); // default
         if (!headers.containsKey("Accept-Encoding"))
@@ -250,16 +334,41 @@ public final class HttpClient implements Runnable {
 
         ByteBuffer request[];
         try {
-            request = encode(cfg.method, headers, cfg.body, uri);
+            if (proxyUri == null) {
+                request = encode(cfg.method, headers, cfg.body, HttpUtils.getPath(uri));
+            } else {
+                String proxyScheme = proxyUri.getScheme();
+                headers.put("Proxy-Connection","Keep-Alive");
+                if (("http".equals(proxyScheme) && ! "https".equals(scheme)) || cfg.tunnel == false)  {
+                    request = encode(cfg.method, headers, cfg.body, uri.toString());
+                } else if ( "https".equals(proxyScheme) || "https".equals(scheme) ){
+                    headers.put("Host", HttpUtils.getProxyHost(uri));
+                    headers.put("Protocol","https");
+                    HttpMethod https_method = cfg.tunnel == true ? HttpMethod.valueOf("CONNECT") : cfg.method;
+                    request = encode(https_method, headers, cfg.body, HttpUtils.getProxyHost(uri));
+                } else {
+                    String message = (proxyScheme == null) ? "No proxy protocol specified" : proxyScheme + " for proxy is not supported";
+                    cb.onThrowable(new ProtocolException(message));
+                    return;
+                }
+            }
         } catch (IOException e) {
             cb.onThrowable(e);
             return;
         }
-        if ("https".equals(scheme)) {
+
+        if ((proxyUri == null && "https".equals(scheme))
+            || (proxyUri != null && "https".equals(proxyUri.getScheme()))) {
             if (engine == null) {
-                engine = DEFAULT_CONTEXT.createSSLEngine();
+                engine = getDefaultContext().createSSLEngine();
+                engine.setUseClientMode(true);
             }
-            engine.setUseClientMode(true);
+            if(!engine.getUseClientMode())
+                engine.setUseClientMode(true);
+
+            // configure SSLEngine with URI
+            sslEngineUriConfigurer.configure(engine, uri);
+
             pending.offer(new HttpsRequest(addr, request, cb, requests, cfg, engine));
         } else {
             pending.offer(new Request(addr, request, cb, requests, cfg));
@@ -270,16 +379,16 @@ public final class HttpClient implements Runnable {
     }
 
     private ByteBuffer[] encode(HttpMethod method, HeaderMap headers, Object body,
-                                URI uri) throws IOException {
+                                String path) throws IOException {
         ByteBuffer bodyBuffer = HttpUtils.bodyBuffer(body);
 
         if (body != null) {
-            headers.put("Content-Length", Integer.toString(bodyBuffer.remaining()));
+            headers.putOrReplace("Content-Length", Integer.toString(bodyBuffer.remaining()));
         } else {
-            headers.put("Content-Length", "0");
+            headers.putOrReplace("Content-Length", "0");
         }
         DynamicBytes bytes = new DynamicBytes(196);
-        bytes.append(method.toString()).append(SP).append(HttpUtils.getPath(uri));
+        bytes.append(method.toString()).append(SP).append(path);
         bytes.append(" HTTP/1.1\r\n");
         headers.encodeHeaders(bytes);
         ByteBuffer headBuffer = ByteBuffer.wrap(bytes.get(), 0, bytes.length());
@@ -296,7 +405,7 @@ public final class HttpClient implements Runnable {
         Request req = (Request) key.attachment();
         try {
             if (ch.finishConnect()) {
-                req.isConnected = true;
+                req.setConnected(true);
                 req.onProgress(now);
                 key.interestOps(OP_WRITE);
                 if (req instanceof HttpsRequest) {
@@ -310,8 +419,8 @@ public final class HttpClient implements Runnable {
     }
 
     private void processPending() {
-        Request job = null;
-        while ((job = pending.poll()) != null) {
+        Request job = pending.peek();
+        if (job != null) {
             if (job.cfg.keepAlive > 0) {
                 PersistentConn con = keepalives.remove(job.addr);
                 if (con != null) { // keep alive
@@ -324,7 +433,8 @@ public final class HttpClient implements Runnable {
                             key.attach(job);
                             key.interestOps(OP_WRITE);
                             requests.offer(job);
-                            continue;
+                            pending.poll();
+                            return;
                         } catch (SSLException e) {
                             closeQuietly(key); // https wrap SSLException, start from fresh
                         }
@@ -334,25 +444,42 @@ public final class HttpClient implements Runnable {
                     }
                 }
             }
-            try {
-                SocketChannel ch = SocketChannel.open();
-                ch.configureBlocking(false);
-                // saved for timeout
-                job.key = ch.register(selector, OP_CONNECT, job);
-                ch.connect(job.addr);
-                requests.offer(job);
-            } catch (IOException e) {
-                job.finish(e);
-                HttpUtils.printError("Try to connect " + job.addr, e);
+            if (maxConnections == -1 || numConnections < maxConnections) {
+                try {
+                    pending.poll();
+                    SocketChannel ch = SocketChannel.open();
+                    ch.setOption(StandardSocketOptions.SO_KEEPALIVE, Boolean.TRUE);
+                    ch.setOption(StandardSocketOptions.TCP_NODELAY, Boolean.TRUE);
+                    if (bindAddress != null) {
+                      ch.bind(bindAddress);
+                    }
+                    ch.configureBlocking(false);
+                    boolean connected = ch.connect(job.addr);
+                    job.setConnected(connected);
+                    numConnections++;
+                    // if connection is established immediatelly, should wait for write. Fix #98
+                    job.key = ch.register(selector, connected ? OP_WRITE : OP_CONNECT, job);
+                    // save key for timeout check
+                    requests.offer(job);
+                } catch (IOException e) {
+                    job.finish(e);
+                    // HttpUtils.printError("Try to connect " + job.addr, e);
+                }
             }
+
         }
     }
 
     public void run() {
         while (running) {
             try {
+                Request first = requests.peek();
+                long timeout = 2000;
+                if (first != null) {
+                    timeout = Math.max(first.toTimeout(currentTimeMillis()), 200L);
+                }
+                int select = selector.select(timeout);
                 long now = currentTimeMillis();
-                int select = selector.select(2000);
                 if (select > 0) {
                     Set<SelectionKey> selectedKeys = selector.selectedKeys();
                     Iterator<SelectionKey> ite = selectedKeys.iterator();
@@ -366,15 +493,16 @@ public final class HttpClient implements Runnable {
                         } else if (key.isReadable()) {
                             doRead(key, now);
                         } else if (key.isWritable()) {
-                            doWrite(key);
+                            doWrite(key, now);
                         }
                         ite.remove();
                     }
                 }
                 clearTimeout(now);
                 processPending();
-            } catch (IOException e) {
-                HttpUtils.printError("select exception", e);
+            } catch (Throwable e) { // catch any exception (including OOM), print it: do not exits the loop
+                errorLogger.log("select exception, should not happen", e);
+                eventLogger.log(eventNames.clientImpossible);
             }
         }
     }

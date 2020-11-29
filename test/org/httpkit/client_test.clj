@@ -3,19 +3,48 @@
         [ring.adapter.jetty :only [run-jetty]]
         [org.httpkit.server :only [run-server]]
         org.httpkit.test-util
-        (compojure [core :only [defroutes GET PUT PATCH DELETE POST HEAD DELETE ANY context]]
+        [clojure.string :only [split]]
+        (compojure [core :only [defroutes GET PUT PATCH DELETE POST HEAD
+                                DELETE ANY context]]
                    [handler :only [site]]
                    [route :only [not-found]])
         (clojure.tools [logging :only [info warn]]))
   (:require [org.httpkit.client :as http]
+            [org.httpkit.sni-client :as sni]
             [clojure.java.io :as io]
-            [clj-http.client :as clj-http]))
+            [clj-http.client :as clj-http])
+  (:import java.nio.ByteBuffer
+           [org.httpkit HttpMethod HttpStatus HttpVersion DynamicBytes]
+           [org.httpkit.client Decoder IRespListener ClientSslEngineFactory]
+           [javax.net.ssl SSLHandshakeException SSLException SSLContext]))
 
 (defroutes test-routes
   (GET "/get" [] "hello world")
   (POST "/post" [] "hello world")
   (ANY "/204" [] {:status 204})
+  (ANY "/redirect" [] (fn [req]
+                        (let [total (-> req :params :total to-int)
+                              n (-> req :params :n to-int)
+                              code (to-int (or (-> req :params :code) "302"))]
+                          (if (>= n total)
+                            {:status 200 :body (-> req :request-method name)}
+                            {:status code
+                             :headers {"location" (str "redirect?total=" total "&n=" (inc n)
+                                                    "&code=" code)}}))))
+  (ANY "/redirect-nil" [] (fn [req]
+                            {:status 302
+                             :headers nil}))
+  (POST "/multipart" [] (fn [req]
+                          (->> req
+                               :params
+                               (reduce-kv
+                                 (fn [acc k v]
+                                   (let [updated (if (map? v) (dissoc v :tempfile :size) v)]
+                                     (assoc acc k updated)))
+                                 {})
+                               pr-str)))
   (PATCH "/patch" [] "hello world")
+  (POST "/nested-param" [] (fn [req] (pr-str (:params req))))
   (ANY "/method" [] (fn [req]
                       (let [m (:request-method req)]
                         {:status 200
@@ -27,11 +56,17 @@
   (GET "/length" [] (fn [req]
                       (let [l (-> req :params :length to-int)]
                         (subs const-string 0 l))))
+  (GET "/multi-header" [] (fn [req]
+                            {:status 200
+                             :headers {"x-method" ["value1", "value2"]
+                                       "x-method2" ["value1", "value2", "value3"]}}))
   (GET "/p" [] (fn [req] (pr-str (:params req))))
   (ANY "/params" [] (fn [req] (-> req :params :param1)))
   (PUT "/body" [] (fn [req] {:body (:body req)
-                            :status 200
-                            :headers {"content-type" "text/plain"}})))
+                             :status 200
+                             :headers {"content-type" "text/plain"}}))
+  (GET "/test-header" [] (fn [{:keys [headers]}] (str (get headers "test-header"))))
+  (GET "/zip" [] (fn [req] {:body "hello world"})))
 
 (use-fixtures :once
   (fn [f]
@@ -54,6 +89,26 @@
                    (/ (double (- (. System (nanoTime)) start#)) 1000000.0)
                    " msecs"))))
 
+(defmulti callback-multi
+  "Assertions to check multimethods can be used as callbacks"
+  :status)
+
+(defmethod callback-multi 200
+  [{status :status :as resp}]
+  (is (= 200 status))
+  resp)
+
+(defmethod callback-multi 404
+  [{status :status :as resp}]
+  (is (= 404 status))
+  resp)
+
+(defmethod callback-multi :default
+  [{status :status :as resp}]
+  (is (not= 200 status))
+  (is (not= 404 status))
+  resp)
+
 (deftest test-http-client
   (doseq [host ["http://127.0.0.1:4347" "http://127.0.0.1:14347"]]
     (is (= 200 (:status @(http/get (str host "/get") (fn [resp]
@@ -70,14 +125,25 @@
     (is (= 200 (:status @(http/head (str host "/get")))))
     (is (= 200 (:status @(http/post (str host "/post")))))
     (is (= 404 (:status @(http/get (str host "/404")))))
+    (is (= 200 (:status @(http/get (str host "/get") callback-multi))))
+    (is (= 404 (:status @(http/get (str host "/404") callback-multi))))
+    (is (= 204 (:status @(http/get (str host "/204") callback-multi))))
     (let [url (str host "/get")]
       (doseq [_ (range 0 10)]
         (let [requests (doall (map (fn [u] (http/get u)) (repeat 20 url)))]
           (doseq [r requests]
             (is (= 200 (:status @r))))))
       (doseq [_ (range 0 200)]
-        (is (= 200 (:status @(http/get url))))))))
+        (is (= 200 (:status @(http/get url))))))
 
+    (testing "callback exception handling"
+      (let [{^Exception error :error} @(http/get (str host "/get")
+                                                 (fn [_] (throw (Exception. "Exception"))))]
+        (is (= "Exception" (.getMessage error))))
+
+      (let [{^Throwable error :error} @(http/get (str host "/get")
+                                                 (fn [_] (throw (Throwable. "Throwable"))))]
+        (is (= "Throwable" (.getMessage error)))))))
 
 (deftest test-unicode-encoding
   (let [u "高性能HTTPServer和Client"
@@ -123,16 +189,16 @@
                (doseq [r requests] @r))))) ; wait all finish
   (let [url "https://127.0.0.1:9898/get"]
     (bench "http-kit, https, concurrency 1, 1000 requests: "
-           (doseq [_ (range 0 1000)] @(http/get url {:sslengine (trust-everybody)})))
+           (doseq [_ (range 0 1000)] @(http/get url {:insecure? true})))
     (bench "http-kit, https, concurrency 10, 1000 requests: "
            (doseq [_ (range 0 100)]
-             (let [requests (doall (map (fn [u] (http/get u {:sslengine (trust-everybody)}))
+             (let [requests (doall (map (fn [u] (http/get u {:insecure? true}))
                                         (repeat 10 url)))]
                (doseq [r requests] @r)))) ; wait all finish
     (bench "clj-http, https, concurrency 1, 1000 requests: "
            (doseq [_ (range 0 1000)] (clj-http/get url {:insecure? true})))
     (bench "http-kit, https, keepalive disabled, concurrency 1, 1000 requests: "
-           (doseq [_ (range 0 1000)] @(http/get url {:sslengine (trust-everybody)
+           (doseq [_ (range 0 1000)] @(http/get url {:insecure? true
                                                      :keepalive -1})))))
 
 (deftest test-http-client-user-agent
@@ -181,11 +247,15 @@
                                 identity)
                  :headers :x-method read-string)))))
 
-(deftest test-string-file-inputstream-body []
+(deftest test-string-file-inputstream-body
   (let [length (+ (rand-int (* 1024 1024 5)) 100)
         file (gen-tempfile length ".txt")
-        bodys [(subs const-string 0 length) file (java.io.FileInputStream. file)
-               [(subs const-string 0 100) (subs const-string 100 length)]]]
+        bodys [(subs const-string 0 length)    ;string
+               file                            ;file
+               (java.io.FileInputStream. file) ; inputstream
+               [(subs const-string 0 100) (subs const-string 100 length)] ; seqable
+               (ByteBuffer/wrap (.getBytes (subs const-string 0 length))) ; byteBuffer
+]]
     (doseq [body bodys]
       (is (= length (count (:body @(http/put "http://127.0.0.1:4347/body"
                                              {:body body}))))))))
@@ -209,26 +279,265 @@
       (is (string? body)))
     (let [body (:body @(http/get url {:as :stream}))]
       (is (instance? java.io.InputStream body)))
-    (let [body (:body @(http/get url {:as :byte-array}))]
+    (let [^bytes body (:body @(http/get url {:as :byte-array}))]
       (is (= 1024 (alength body))))))
 
 (deftest test-https
   (let [get-url (fn [length] (str "https://localhost:9898/length?length=" length))]
     (doseq [i (range 0 2)]
       (doseq [length (repeatedly 40 (partial rand-int (* 4 1024 1024)))]
-        (let [{:keys [body error status]} @(http/get (get-url length)
-                                                     {:sslengine (trust-everybody)})]
-          (if error (.printStackTrace error))
+        (let [{:keys [body error status]} @(http/get (get-url length) {:insecure? true})]
+          (if error (.printStackTrace ^Throwable error))
           (is (= length (count body)))))
       (doseq [length (repeatedly 40 (partial rand-int (* 4 1024 1024)))]
         (is (= length (-> @(http/get (get-url length)
-                                     {:sslengine (trust-everybody)
-                                      :keepalive -1})
+                                     {:insecure? true :keepalive -1})
                           :body count))))
       (doseq [length (repeatedly 40 (partial rand-int (* 4 1024 1024)))]
         (is (= length (-> @(http/get (get-url length)
-                                     (assoc (rand-keep-alive) :sslengine (trust-everybody)))
+                                     (assoc (rand-keep-alive) :insecure? true))
                           :body count)))))))
+
+(deftest test-misc-https-certs
+  ;; Check to make sure an https connection works using the default trust store.
+  (is (contains? @(http/get "https://status.github.com/api/status.json") :status))
+  (is (contains? @(http/get "https://google.com") :status))
+  (is (contains? @(http/get "https://apple.com") :status))
+  (is (contains? @(http/get "https://microsoft.com") :status))
+  (is (contains? @(http/get "https://letsencrypt.org") :status)))
+
+(deftest test-multiple-https-calls-with-same-engine
+  (let [opts {:sslengine (ClientSslEngineFactory/trustAnybody)}]
+    (is (contains? @(http/get "https://localhost:9898" opts) :status))
+    (is (contains? @(http/get "https://localhost:9898" opts) :status))
+    (is (contains? @(http/get "https://localhost:9898" opts) :status))))
+
+(deftest test-default-sni-client
+  (testing "`sni/default-client` behaves similarly to `URL.openStream()`"
+    (let [sslengine (http/make-ssl-engine)
+          https-client @sni/default-client
+          url0 "https://www.bbc.co.uk"
+          url1 "https://wrong.host.badssl.com"
+          url2 "https://self-signed.badssl.com"
+          url3 "https://untrusted-root.badssl.com"]
+
+      (is (nil?
+            (:error
+             @(http/request
+                {:client  https-client
+                 :sslengine sslengine
+                 :keepalive -1
+                 :url url0}))))
+
+      (when (>= @@#'sni/java-version_ 11)
+        ;; Specific type depends on JVM version- could be e/o
+        ;; #{SSLHandshakeException RuntimeException ...}
+        (is (instance? Exception
+              (:error
+               @(http/request
+                  {:client https-client
+                   :sslengine sslengine
+                   :keepalive -1
+                   :url url1})))))
+
+      (is (instance? #_SSLException Exception
+                     (:error
+                       @(http/request
+                          {:client  https-client
+                           :sslengine sslengine
+                           :keepalive -1
+                           :url url2}))))
+
+      (is (instance? #_SSLException Exception
+                     (:error
+                       @(http/request
+                          {:client  https-client
+                           :sslengine sslengine
+                           :keepalive -1
+                           :url url3})))))))
+
+;; https://github.com/http-kit/http-kit/issues/54
+(deftest test-nested-param
+  (let [url "http://localhost:4347/nested-param"
+        params {:card {:number "4242424242424242" :exp_month "12"}}]
+    (is (= params (read-string (:body @(http/post url {:form-params params})))))
+
+    (is (= params (read-string (:body @(http/post
+                                        url
+                                        {:query-params {"card[number]" 4242424242424242
+                                                       "card[exp_month]" 12}})))))
+    (is (= params (read-string (:body (clj-http/post url {:query-params params})))))
+
+    ;; clj-http doesn't actually process these as nested params anymore. Leaving
+    ;; to maintain backward compatibility
+    (is (= params (read-string (:body @(http/post
+                                        url
+                                        {:form-params {"card[number]" 4242424242424242
+                                                       "card[exp_month]" 12}})))))))
+
+(deftest test-redirect
+  (testing "When location header is"
+    (testing "present"
+      (let [url "http://localhost:4347/redirect?total=5&n=0"]
+        (is (:error @(http/get url {:max-redirects 3})))        ;; too many redirects
+        (is (= 200 (:status @(http/get url {:max-redirects 6}))))
+        (is (= 302 (:status @(http/get url {:follow-redirects false}))))
+        (is (= "get" (:body @(http/post url {:as :text}))))     ; should switch to get method
+        (is (= "post" (:body @(http/post url {:as :text :allow-unsafe-redirect-methods true})))) ; should not change method
+        (is (= "post" (:body @(http/post (str url "&code=307") {:as :text})))))) ; should not change method
+    (testing "nil"
+      (let [url "http://localhost:4347/redirect-nil"]
+           (is (:error  @(http/get url)))))))
+
+(deftest test-multipart
+  (let [{:keys [status body]} @(http/post "http://localhost:4347/multipart"
+                                          {:multipart [{:name    "comment"
+                                                        :content "httpkit's project.clj"}
+                                                       {:name     "file"
+                                                        :content  (clojure.java.io/file "project.clj")
+                                                        :filename "project.clj"}
+                                                       {:name    "bytes"
+                                                        :content (.getBytes "httpkit's project.clj" "UTF-8")}
+                                                       {:name         "custom-content-type"
+                                                        :content      (clojure.java.io/file "LICENSE.txt")
+                                                        :filename     "LICENSE.txt"
+                                                        :content-type "text/plain"}]})]
+
+    (is (= 200 status))
+    (is (= {:bytes               "httpkit's project.clj"
+            :comment             "httpkit's project.clj"
+            :custom-content-type {:content-type "text/plain"
+                                  :filename     "LICENSE.txt"}
+            :file                {:content-type "application/octet-stream"
+                                  :filename     "project.clj"}}
+           (read-string body)))))
+
+(deftest test-coerce-req
+  (testing "Headers should be the same regardless of multipart"
+    (let [coerce-req #'org.httpkit.client/coerce-req
+          request {:basic-auth ["user" "pass"]}]
+      (is (= (keys (:headers (coerce-req request)))
+             (remove #(= % "Content-Type")
+                     (keys (:headers (coerce-req (assoc request :multipart [{:name "foo" :content "bar"}]))))))))))
+
+(deftest test-header-multiple-values
+  (let [resp @(http/get "http://localhost:4347/multi-header" {:headers {"foo" ["bar" "baz"], "eggplant" "quux"}})
+        resp2 (clj-http/get "http://localhost:4347/multi-header" {:headers {"foo" ["bar" "baz"], "eggplant" "quux"}})]
+    (is (= 200 (:status resp)))
+    (is (= 3 (count (split (-> resp :headers :x-method2) #","))))
+    (is (= 2 (count (split (-> resp :headers :x-method) #","))))
+    (is (= 200 (:status resp2)))))
+
+(deftest test-headers-stringified
+  (doseq [[sent expected] [["test" "test"]
+                           [0 "0"]
+                           ['(0) "0"]
+                           ['("a" "b") "a,b"]]]
+    (let [received (:body @(http/get "http://localhost:4347/test-header"
+                                     {:headers {"test-header" sent}}))]
+      (is (= received expected)))))
+
+(defn- utf8 [^String s] (ByteBuffer/wrap (.getBytes s "UTF-8")))
+
+(defn- decode
+  [method buffer]
+  (let [out (atom [])
+        listener (reify IRespListener
+                   (onInitialLineReceived [_ v s] (swap! out conj [:init v s]))
+                   (onHeadersReceived [_ hs]      (swap! out conj [:headers hs]))
+                   (onBodyReceived [_ buf n]      (swap! out conj [:body (into [] (take n buf))]))
+                   (onCompleted [_]               (swap! out conj [:completed]))
+                   (onThrowable [_ t]             (swap! out conj [:error t])))]
+    (.decode (Decoder. listener method) buffer)
+    @out))
+
+(deftest test-decode-partial-status-line
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; The Status-Line is only parsed once there is a CRLF in the end.
+    HttpMethod/GET "" []
+    HttpMethod/GET "HTTP/1.1" []
+    HttpMethod/GET "HTTP/1.1 200 OK" []
+    HttpMethod/GET "HTTP/1.1totally-broken-line" []))
+
+(deftest test-decode-http-version
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; HTTP version string is parsed.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]
+    HttpMethod/GET "HTTP/1.0 200 OK\r\n" [[:init HttpVersion/HTTP_1_0 HttpStatus/OK]]))
+
+(deftest test-decode-empty-reason-phrase
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; The Reason-Phrase (after Status-Code) may be omitted.
+    HttpMethod/GET "HTTP/1.1 200 \r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]
+
+    ;; A Status-Line with no space after the Status-Code does not comply to the RFC 2616,
+    ;; but there is probably little reason not to allow it in the parser.
+    HttpMethod/GET "HTTP/1.1 200\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]))
+
+(deftest test-decode-empty-headers
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; Empty headers
+    HttpMethod/GET "HTTP/1.1 200 OK\r\n\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK] [:headers {}]]
+    HttpMethod/GET "HTTP/1.1 200 \r\n\r\n" [[:init HttpVersion/HTTP_1_1 HttpStatus/OK] [:headers {}]]))
+
+(deftest test-decode-headers
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; Headers are not emitted before two consecutive CRLF's
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n"
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]]
+
+    ;; One header.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n"
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "0"}]]))
+
+(deftest test-decode-body
+  (are [method resp events] (= (decode method (utf8 resp)) events)
+    ;; Empty body with zero content-length, no matter what bytes follow.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n..."
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "0"}]]
+
+    ;; Expecting one byte, but no content available yet.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "1"}]]
+
+     ;; One byte.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n."
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "1"}]
+     [:body [46]]]
+
+     ;; One byte. The rest is ignored.
+    HttpMethod/GET "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n..."
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "1"}]
+     [:body [46]]]
+
+    ;; The body is omitted for HEAD requests.
+    HttpMethod/HEAD "HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\n..."
+    [[:init HttpVersion/HTTP_1_1 HttpStatus/OK]
+     [:headers {"content-length" "3"}]]))
+
+(deftest deadlock-guard
+  (let [loop-depth 2
+        bad-callback
+        (fn bad-callback [n disable?]
+          (when (pos? n)
+            @(http/get "badurl"
+                       (when disable?
+                         {:deadlock-guard? false})
+                       (fn [res] (bad-callback (dec n) disable?)))))]
+    (let [{:keys [error] :as resp} (bad-callback loop-depth false)]
+      (is (and error (re-find #"deadlock-guard" (.getMessage error)))))
+    (if (< loop-depth (.getMaximumPoolSize http/default-pool))
+      (let [{:keys [error]} (bad-callback loop-depth true)]
+        (is (= nil error)))
+      (println "Skipping disabled-deadlock-guard test due to low CPU count."))))
+
+(deftest zip
+  (is (instance? DynamicBytes (:body @(http/get "http://localhost:4347/zip" {:as :none})))))
 
 ;; @(http/get "http://127.0.0.1:4348" {:headers {"Connection" "Close"}})
 

@@ -1,7 +1,6 @@
 (ns org.httpkit.test-util
   (:use clojure.test)
-  (:import [java.io File FileOutputStream FileInputStream]
-           org.httpkit.client.SslContextFactory))
+  (:import [java.io File FileOutputStream FileInputStream]))
 
 (defn- string-80k []
   (apply str (map char
@@ -15,14 +14,14 @@
 (defn ^File gen-tempfile
   "generate a tempfile, the file will be deleted before jvm shutdown"
   ([size extension]
-     (let [tmp (doto
-                   (File/createTempFile "tmp_" extension)
-                 (.deleteOnExit))]
-       (with-open [w (FileOutputStream. tmp)]
-         (.write w ^bytes (.getBytes (subs const-string 0 size))))
-       tmp)))
+   (let [tmp (doto
+              (File/createTempFile "tmp_" extension)
+               (.deleteOnExit))]
+     (with-open [w (FileOutputStream. tmp)]
+       (.write w ^bytes (.getBytes (subs const-string 0 size))))
+     tmp)))
 
-(defn to-int [int-str] (Integer/valueOf int-str))
+(defn to-int [^String int-str] (Integer/valueOf int-str))
 
 (def channel-closed (atom false))
 
@@ -45,6 +44,3 @@
 
 (defn close-handler [status]
   (reset! channel-closed true))
-
-(defn trust-everybody []
-  (.createSSLEngine (SslContextFactory/getClientContext)))

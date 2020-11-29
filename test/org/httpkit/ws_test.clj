@@ -9,7 +9,8 @@
             [org.httpkit.client :as client]
             [http.async.client :as h]
             [clj-http.util :as u])
-  (:import [org.httpkit.ws WebSocketClient]))
+  (:import [org.httpkit.ws WebSocketClient]
+           org.httpkit.SpecialHttpClient))
 
 (defn ws-handler [req]
   (with-channel req con
@@ -22,14 +23,6 @@
                         (catch Exception e
                           (println e)
                           (send! con msg)))))))
-
-(defn ws-handler-sent-on-connect [req]
-  (with-channel req con
-    (send! con "hello") ;; should sendable when on-connet
-    (send! con "world")
-    (on-receive con (fn [mesg]
-                      ;; only :body is picked
-                      (send! con {:body mesg}))))) ; echo back
 
 (defn ws-handler-async-client [req] ;; test with http.async.client, echo back
   (with-channel req con
@@ -44,6 +37,10 @@
                                    (java.io.ByteArrayInputStream. retdata)
                                    retdata)]
                         (send! con data))))))
+
+(defn ping-ws-handler [req]
+  (with-channel req con
+    (on-ping con (fn [data] (send! con (str "ECHO: " (String. data "UTF-8")))))))
 
 (defn messg-order-handler [req]
   (with-channel req con
@@ -72,12 +69,12 @@
 
 (defroutes test-routes
   (GET "/ws" [] ws-handler)
-  (GET "/sent-on-connect" [] ws-handler-sent-on-connect)
   (GET "/echo" [] ws-handler-async-client)
   (GET "/http-async-client" [] ws-handler-async-client)
   (GET "/binary" [] binary-ws-handler)
   (GET "/interleaved" [] not-interleave-handler)
-  (GET "/order" [] messg-order-handler))
+  (GET "/order" [] messg-order-handler)
+  (GET "/ping-pong" [] ping-ws-handler))
 
 (use-fixtures :once (fn [f]
                       (let [server (run-server
@@ -117,17 +114,14 @@
                             "\nreceive:\n" r))
               (is false))))
         (let [d (subs const-string 0 120)]
-          (= d (.ping client d)))))
+          (is (= d (.ping client d)))
+          (.pong client d))))
     (.close client)))
 
-(deftest test-sent-message-in-body      ; issue #14
-  (let [client (WebSocketClient. "ws://localhost:4348/sent-on-connect")]
-    (is (= "hello" (.getMessage client)))
-    (is (= "world" (.getMessage client)))
-    (doseq [idx (range 0 3)]
-      (let [mesg (str "message#" idx)]
-        (.sendMessage client mesg)
-        (is (= mesg (.getMessage client))))) ;; echo expected
+(deftest test-websocket-ping-handler
+  (let [client (WebSocketClient. "ws://localhost:4348/ping-pong")]
+    (.ping client "TEST")
+    (is (= "ECHO: TEST" (.getMessage client)))
     (.close client)))
 
 (deftest test-tcp-segmented-frame-does-right  ; issue #47
@@ -140,14 +134,19 @@
       (.sendMessage client data)
       (is (= data (.getMessage client))))))
 
+;; client can sent a byte a time
+;; https://github.com/http-kit/http-kit/issues/80
+(deftest test-slow-client
+  (is (SpecialHttpClient/slowWebSocketClient "ws://localhost:4348/echo")))
+
 (deftest test-binary-frame
   (let [client (WebSocketClient. "ws://localhost:4348/binary")]
     (dotimes [_ 5]
       (let [length (min 1024 (rand-int 10024))
             data (byte-array length (take length (repeatedly #(byte (rand-int 126)))))
-            sorted-data (doto (aclone data) (java.util.Arrays/sort))]
+            ^bytes sorted-data (doto (aclone data) (java.util.Arrays/sort))]
         (.sendBinaryData client data)
-        (let [output (.getMessage client)]
+        (let [^bytes output (.getMessage client)]
           (is (java.util.Arrays/equals sorted-data output)))))
     (.close client)))
 
@@ -198,10 +197,10 @@
                                   (deliver latch true))
                           :close (fn [con status]
                                    ;; (println "close:" con status)
-                                   )
+)
                           :open (fn [con]
                                   ;; (println "opened:" con)
-                                  ))]
+))]
       ;; (h/send ws :byte (byte-array 10)) not implemented yet
       (let [msg "testing12"]
         (h/send ws :text msg)

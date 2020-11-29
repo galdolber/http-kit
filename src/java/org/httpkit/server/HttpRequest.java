@@ -20,7 +20,7 @@ public class HttpRequest {
     // package visible
     int serverPort = 80;
     String serverName;
-    Map<String, String> headers;
+    Map<String, Object> headers;
     int contentLength = 0;
     String contentType;
     String charset = "utf8";
@@ -51,7 +51,7 @@ public class HttpRequest {
     }
 
     public String getRemoteAddr() {
-        String h = headers.get(HttpUtils.X_FORWARDED_FOR);
+        String h = getStringValue(headers, HttpUtils.X_FORWARDED_FOR);
         if (null != h) {
             int idx = h.indexOf(',');
             if (idx == -1) {
@@ -70,11 +70,15 @@ public class HttpRequest {
         this.contentLength = count;
     }
 
-    public void setHeaders(Map<String, String> headers) {
-        String h = headers.get("host");
-        if (h != null) {
+    public void setHeaders(Map<String, Object> headers) {
+        String h = getStringValue(headers, "host");
+        if (h != null && !h.equals("")) {
+            // the port is an integer following the last ':'
+            // *unless* the last : is prior to the last ] which marks the end of an ipv6 address
+            // https://en.wikipedia.org/wiki/IPv6_address#Literal_IPv6_addresses_in_network_resource_identifiers
+            int ipv6end = (h.charAt(0) == '[') ? h.lastIndexOf(']') : 0;
             int idx = h.lastIndexOf(':');
-            if (idx != -1) {
+            if (idx != -1 && idx > ipv6end) {
                 this.serverName = h.substring(0, idx);
                 serverPort = Integer.valueOf(h.substring(idx + 1));
             } else {
@@ -82,7 +86,7 @@ public class HttpRequest {
             }
         }
 
-        String ct = headers.get(CONTENT_TYPE);
+        String ct = getStringValue(headers, CONTENT_TYPE);
         if (ct != null) {
             int idx = ct.indexOf(";");
             if (idx != -1) {
@@ -98,13 +102,13 @@ public class HttpRequest {
             }
         }
 
-        String con = headers.get(CONNECTION);
+        String con = getStringValue(headers, CONNECTION);
         if (con != null) {
             con = con.toLowerCase();
         }
 
         isKeepAlive = (version == HTTP_1_1 && !"close".equals(con)) || "keep-alive".equals(con);
-        isWebSocket = "websocket".equalsIgnoreCase(headers.get("upgrade"));
+        isWebSocket = "websocket".equalsIgnoreCase(getStringValue(headers, "upgrade"));
         this.headers = headers;
     }
 }

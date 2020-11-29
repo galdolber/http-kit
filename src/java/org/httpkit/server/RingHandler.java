@@ -1,20 +1,36 @@
 package org.httpkit.server;
 
-import clojure.lang.*;
-import org.httpkit.HeaderMap;
-import org.httpkit.HttpUtils;
-import org.httpkit.PrefixThreadFactory;
-
-import java.util.Map;
-import java.util.TreeMap;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicReference;
-
 import static clojure.lang.Keyword.intern;
 import static org.httpkit.HttpUtils.HttpEncode;
 import static org.httpkit.HttpVersion.HTTP_1_0;
-import static org.httpkit.server.ClojureRing.*;
-import static org.httpkit.server.Frame.TextFrame;
+import static org.httpkit.server.ClojureRing.BODY;
+import static org.httpkit.server.ClojureRing.HEADERS;
+import static org.httpkit.server.ClojureRing.buildRequestMap;
+import static org.httpkit.server.ClojureRing.getStatus;
+
+import java.util.Map;
+import java.util.TreeMap;
+import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import org.httpkit.HeaderMap;
+import org.httpkit.PrefixThreadFactory;
+import org.httpkit.logger.ContextLogger;
+import org.httpkit.logger.EventNames;
+import org.httpkit.logger.EventLogger;
+import org.httpkit.server.Frame.TextFrame;
+import org.httpkit.server.Frame.BinaryFrame;
+import org.httpkit.server.Frame.PingFrame;
+
+import clojure.lang.IFn;
+import clojure.lang.IPersistentMap;
+import clojure.lang.Keyword;
+import clojure.lang.PersistentArrayMap;
 
 @SuppressWarnings({"rawtypes", "unchecked"})
 class ClojureRing {
@@ -80,17 +96,28 @@ class HttpHandler implements Runnable {
     final RespCallback cb;
     final IFn handler;
 
-    public HttpHandler(HttpRequest req, RespCallback cb, IFn handler) {
+    final ContextLogger<String, Throwable> errorLogger;
+    final EventLogger<String> eventLogger;
+    final EventNames eventNames;
+    final String serverHeader;
+
+    public HttpHandler(HttpRequest req, RespCallback cb, IFn handler,
+            ContextLogger<String, Throwable> errorLogger, EventLogger<String> eventLogger, EventNames eventNames, String serverHeader) {
         this.req = req;
         this.cb = cb;
         this.handler = handler;
+        this.errorLogger = errorLogger;
+        this.eventLogger = eventLogger;
+        this.eventNames = eventNames;
+        this.serverHeader = serverHeader;
     }
 
     public void run() {
         try {
             Map resp = (Map) handler.invoke(buildRequestMap(req));
             if (resp == null) { // handler return null
-                cb.run(HttpEncode(404, new HeaderMap(), null));
+                cb.run(HttpEncode(404, new HeaderMap(), null, this.serverHeader));
+                eventLogger.log(eventNames.serverStatus404);
             } else {
                 Object body = resp.get(BODY);
                 if (!(body instanceof AsyncChannel)) { // hijacked
@@ -98,12 +125,15 @@ class HttpHandler implements Runnable {
                     if (req.version == HTTP_1_0 && req.isKeepAlive) {
                         headers.put("Connection", "Keep-Alive");
                     }
-                    cb.run(HttpEncode(getStatus(resp), headers, body));
+                    final int status = getStatus(resp);
+                    cb.run(HttpEncode(status, headers, body, this.serverHeader));
+                    eventLogger.log(eventNames.serverStatusPrefix + status);
                 }
             }
         } catch (Throwable e) {
-            cb.run(HttpEncode(500, new HeaderMap(), e.getMessage()));
-            HttpUtils.printError(req.method + " " + req.uri, e);
+            cb.run(HttpEncode(500, new HeaderMap(), e.getMessage(), this.serverHeader));
+            errorLogger.log(req.method + " " + req.uri, e);
+            eventLogger.log(eventNames.serverStatus500);
         }
     }
 }
@@ -118,8 +148,12 @@ class LinkingRunnable implements Runnable {
 
     public void run() {
         impl.run();
-        if (!next.compareAndSet(null, this)) { // has more job to run
-            next.get().run();
+
+        // Run all jobs in this chain without consuming extra call stack
+        LinkingRunnable r = this;
+        while (!r.next.compareAndSet(null, r)) {
+            r = r.next.get();
+            r.impl.run();
         }
     }
 }
@@ -128,9 +162,18 @@ class WSHandler implements Runnable {
     private Frame frame;
     private AsyncChannel channel;
 
-    protected WSHandler(AsyncChannel channel, Frame frame) {
+    private final ContextLogger<String, Throwable> errorLogger;
+    private final EventLogger<String> eventLogger;
+    private final EventNames eventNames;
+
+    protected WSHandler(AsyncChannel channel, Frame frame,
+            ContextLogger<String, Throwable> errorLogger,
+            EventLogger<String> eventLogger, EventNames eventNames) {
         this.channel = channel;
         this.frame = frame;
+        this.errorLogger = errorLogger;
+        this.eventLogger = eventLogger;
+        this.eventNames = eventNames;
     }
 
     @Override
@@ -138,11 +181,16 @@ class WSHandler implements Runnable {
         try {
             if (frame instanceof TextFrame) {
                 channel.messageReceived(((TextFrame) frame).getText());
-            } else {
+            } else if (frame instanceof BinaryFrame) {
                 channel.messageReceived(frame.data);
+            } else if (frame instanceof PingFrame) {
+                channel.pingReceived(frame.data);
+            } else {
+                errorLogger.log("Unknown frame received in websocket handler " + frame, null);
             }
         } catch (Throwable e) {
-            HttpUtils.printError("handle websocket frame " + frame, e);
+            errorLogger.log("handle websocket frame " + frame, e);
+            eventLogger.log(eventNames.serverWsFrameError);
         }
     }
 }
@@ -151,28 +199,70 @@ public class RingHandler implements IHandler {
     final ExecutorService execs;
     final IFn handler;
 
-    public RingHandler(int thread, IFn handler, String prefix, int queueSize) {
+    final ContextLogger<String, Throwable> errorLogger;
+    final EventLogger<String> eventLogger;
+    final EventNames eventNames;
+    final String serverHeader;
+
+    public RingHandler(IFn handler, ExecutorService execs) {
+        this(handler, execs, ContextLogger.ERROR_PRINTER, EventLogger.NOP, EventNames.DEFAULT, "http-kit");
+    }
+
+    public RingHandler(int thread, IFn handler, String prefix, int queueSize, String serverHeader) {
+        this(thread, handler, prefix, queueSize, serverHeader, ContextLogger.ERROR_PRINTER, EventLogger.NOP, EventNames.DEFAULT);
+    }
+
+    public RingHandler(int thread, IFn handler, String prefix, int queueSize, String serverHeader,
+            ContextLogger<String, Throwable> errorLogger, EventLogger<String> eventLogger, EventNames eventNames) {
+        this.errorLogger = errorLogger;
+        this.eventLogger = eventLogger;
+        this.eventNames = eventNames;
         PrefixThreadFactory factory = new PrefixThreadFactory(prefix);
         BlockingQueue<Runnable> queue = new ArrayBlockingQueue<Runnable>(queueSize);
         execs = new ThreadPoolExecutor(thread, thread, 0, TimeUnit.MILLISECONDS, queue, factory);
         this.handler = handler;
+        this.serverHeader = serverHeader;
+    }
+
+    public RingHandler(IFn handler, ExecutorService execs,
+            ContextLogger<String, Throwable> errorLogger, EventLogger<String> eventLogger, EventNames eventNames,
+            String serverHeader) {
+        this.handler = handler;
+        this.execs = execs;
+        this.errorLogger = errorLogger;
+        this.eventLogger = eventLogger;
+        this.eventNames = eventNames;
+        this.serverHeader = serverHeader;
     }
 
     public void handle(HttpRequest req, RespCallback cb) {
         try {
-            execs.submit(new HttpHandler(req, cb, handler));
+            execs.submit(new HttpHandler(req, cb, handler, errorLogger, eventLogger, eventNames, this.serverHeader));
         } catch (RejectedExecutionException e) {
-            HttpUtils.printError("increase :queue-size if this happens often", e);
-            cb.run(HttpEncode(503, new HeaderMap(), "Server is overloaded, please try later"));
+            errorLogger.log("failed to submit task to executor service", e);
+            eventLogger.log(eventNames.serverStatus503);
+            cb.run(HttpEncode(503, new HeaderMap(), "Server unavailable, please try again", this.serverHeader));
         }
     }
 
-    public void close() {
-        execs.shutdownNow();
+    public void close(int timeoutTs) {
+        if (timeoutTs > 0) {
+            execs.shutdown();
+            try {
+                if (!execs.awaitTermination(timeoutTs, TimeUnit.MILLISECONDS)) {
+                    execs.shutdownNow();
+                }
+            } catch (InterruptedException ie) {
+                execs.shutdownNow();
+                Thread.currentThread().interrupt();
+            }
+        } else {
+            execs.shutdownNow();
+        }
     }
 
     public void handle(AsyncChannel channel, Frame frame) {
-        WSHandler task = new WSHandler(channel, frame);
+        WSHandler task = new WSHandler(channel, frame, errorLogger, eventLogger, eventNames);
 
         // messages from the same client are handled orderly
         LinkingRunnable job = new LinkingRunnable(task);
@@ -189,14 +279,15 @@ public class RingHandler implements IHandler {
             }
         } catch (RejectedExecutionException e) {
             // TODO notify client if server is overloaded
-            HttpUtils.printError("increase :queue-size if this happens often", e);
+            errorLogger.log("increase :queue-size if this happens often", e);
+            eventLogger.log(eventNames.serverStatus503Todo);
         }
     }
 
     public void clientClose(final AsyncChannel channel, final int status) {
-        if (channel.closedRan == 0) { // server did not close it first
+        if (!channel.isClosed()) { // server did not close it first
             // has close handler, execute it in another thread
-            if (channel.closeHandler != null) {
+            if (channel.hasCloseHandler()) {
                 try {
                     // no need to maintain order
                     execs.submit(new Runnable() {
@@ -204,18 +295,37 @@ public class RingHandler implements IHandler {
                             try {
                                 channel.onClose(status);
                             } catch (Exception e) {
-                                HttpUtils.printError("on close handler", e);
+                                errorLogger.log("on close handler", e);
+                                eventLogger.log(eventNames.serverChannelCloseError);
                             }
                         }
                     });
                 } catch (RejectedExecutionException e) {
-                    HttpUtils.printError("increase :queue-size if this happens often", e);
+                    /*
+                    https://github.com/http-kit/http-kit/issues/152
+                    https://github.com/http-kit/http-kit/pull/155
+
+                    When stop-server get called, the thread-pool will call shutdown, wait for sometime
+                    for work to be finished.
+
+                    For websocket and long polling with closeHandler registered, we exec closeHandler
+                    in the current thread. Get this idea from @pyr, by #155
+                     */
+                    if (execs.isShutdown()) {
+                        try {
+                            channel.onClose(status);  // do it in current thread
+                        } catch (Exception e1) {
+                            errorLogger.log("on close handler", e);
+                            eventLogger.log(eventNames.serverChannelCloseError);
+                        }
+                    } else {
+                        errorLogger.log("increase :queue-size if this happens often", e);
+                        eventLogger.log(eventNames.serverStatus503Todo);
+                    }
                 }
             } else {
                 // no close handler, mark the connection as closed
-                // channel.closedRan = 1;
-                // lazySet
-                AsyncChannel.unsafe.putOrderedInt(channel, AsyncChannel.closedRanOffset, 1);
+                channel.closedRan.set(false);
             }
         }
     }

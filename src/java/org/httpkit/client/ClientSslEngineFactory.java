@@ -7,7 +7,30 @@ import java.security.KeyStoreException;
 import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
 
-public class TrustManagerFactory extends TrustManagerFactorySpi {
+
+public class ClientSslEngineFactory {
+
+    private static final String PROTOCOL = "TLS";
+    private static SSLContext clientContext = null;
+
+    public static SSLEngine trustAnybody() {
+        try {
+            clientContext = SSLContext.getInstance(PROTOCOL);
+            clientContext.init(null, TrustManagerFactory.getTrustManagers(),
+                    null);
+        } catch (Exception e) {
+            throw new Error(
+                    "Failed to initialize the client-side SSLContext", e);
+        }
+        
+        SSLEngine engine = clientContext.createSSLEngine();
+        engine.setUseClientMode(true);
+        return engine;
+    }
+}
+
+
+class TrustManagerFactory extends TrustManagerFactorySpi {
 
     private static final TrustManager DUMMY_TRUST_MANAGER = new X509TrustManager() {
         public X509Certificate[] getAcceptedIssuers() {

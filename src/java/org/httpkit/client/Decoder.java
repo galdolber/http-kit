@@ -19,7 +19,7 @@ enum State {
 
 public class Decoder {
 
-    private final Map<String, String> headers = new TreeMap<String, String>();
+    private final Map<String, Object> headers = new TreeMap<String, Object>();
     // package visible
     final IRespListener listener;
     private final LineReader lineReader;
@@ -32,7 +32,7 @@ public class Decoder {
     public Decoder(IRespListener listener, HttpMethod method) {
         this.listener = listener;
         this.method = method;
-        lineReader = new LineReader(8096);
+        lineReader = new LineReader(16192); // max 16k header line
     }
 
     private void parseInitialLine(String sb) throws ProtocolException, AbortException {
@@ -50,7 +50,7 @@ public class Decoder {
         bEnd = findWhitespace(sb, bStart);
 
         cStart = findNonWhitespace(sb, bEnd);
-        cEnd = findEndOfString(sb);
+        cEnd = findEndOfString(sb, cStart);
 
         if ((cStart < cEnd)
                 // Account for buggy web servers that omit Reason-Phrase from Status-Line.
@@ -109,12 +109,10 @@ public class Decoder {
                     readBody(buffer, READ_CHUNK_DELIMITER);
                     break;
                 case READ_CHUNK_FOOTER:
-                    readEmptyLine(buffer);
-                    state = ALL_READ;
+                    readEmptyLine(buffer, ALL_READ);
                     break;
                 case READ_CHUNK_DELIMITER:
-                    readEmptyLine(buffer);
-                    state = READ_CHUNK_SIZE;
+                    readEmptyLine(buffer, READ_CHUNK_SIZE);
                     break;
                 case READ_VARIABLE_LENGTH_CONTENT:
                     readBody(buffer, null);
@@ -137,14 +135,18 @@ public class Decoder {
         }
     }
 
-    void readEmptyLine(ByteBuffer buffer) {
-        byte b = buffer.get();
-        if (b == CR && buffer.hasRemaining()) {
-            buffer.get(); // should be LF
+    private void readEmptyLine(ByteBuffer buffer, State nextState) throws ProtocolException, LineTooLargeException {
+        String line = lineReader.readLine(buffer);
+        if (line != null) {
+            if (line.isEmpty()) {
+                state = nextState;
+            } else {
+                throw new ProtocolException("Expected an empty line, but found " + line);
+            }
         }
     }
 
-    private void readHeaders(ByteBuffer buffer) throws LineTooLargeException, AbortException {
+    private void readHeaders(ByteBuffer buffer) throws LineTooLargeException, AbortException, ProtocolException {
         String line = lineReader.readLine(buffer);
         while (line != null && !line.isEmpty()) {
             HttpUtils.splitAndAddHeader(line, headers);
@@ -158,11 +160,11 @@ public class Decoder {
             return;
         }
 
-        String te = headers.get(TRANSFER_ENCODING);
+        String te = HttpUtils.getStringValue(headers, TRANSFER_ENCODING);
         if (CHUNKED.equals(te)) {
             state = READ_CHUNK_SIZE;
         } else {
-            String cl = headers.get(CONTENT_LENGTH);
+            String cl = HttpUtils.getStringValue(headers, CONTENT_LENGTH);
             if (cl != null) {
                 readRemaining = Integer.parseInt(cl);
                 if (readRemaining == 0) {

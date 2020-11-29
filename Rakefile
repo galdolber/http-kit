@@ -5,6 +5,11 @@ task :test do
   sh './scripts/javac with-test && lein test'
 end
 
+desc "Run java unit tests"
+task :junit do
+  sh './scripts/junit'
+end
+
 desc "Run some benchmark test"
 task :benchmark do
   sh './scripts/javac with-test && lein test :benchmark'
@@ -19,7 +24,7 @@ end
 desc "Install in clojars repository"
 task :clojars => :test do
   sh 'rm -rf *.jar pom.xml classes target && lein pom && lein jar'
-  sh "cp target/*.jar ."
+  sh "cp target/provided/*.jar ."
   sh 'scp pom.xml *.jar clojars@clojars.org:'
 end
 

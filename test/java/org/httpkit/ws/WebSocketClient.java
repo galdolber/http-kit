@@ -56,10 +56,10 @@ public class WebSocketClient {
         });
         ChannelFuture future = bootstrap.connect(new InetSocketAddress(uri.getHost(), uri
                 .getPort()));
-        future.syncUninterruptibly();
+        future.awaitUninterruptibly();
 
         ch = future.getChannel();
-        handshaker.handshake(ch).syncUninterruptibly();
+        handshaker.handshake(ch).awaitUninterruptibly();
         latch.await(); // wait for handleshake complete
     }
 
@@ -93,13 +93,21 @@ public class WebSocketClient {
     }
 
     public Object getMessage() throws InterruptedException {
-        WebSocketFrame frame = queue.poll(5, TimeUnit.SECONDS);
+        int waitTimeout = 50; // Travis CI machines are sometimes VERY slow
+        WebSocketFrame frame = queue.poll(waitTimeout, TimeUnit.SECONDS);
         if (frame instanceof TextWebSocketFrame) {
             return ((TextWebSocketFrame) frame).getText();
         } else if (frame instanceof BinaryWebSocketFrame) {
             return frame.getBinaryData().array();
+        } else if (frame == null) {
+            throw new IllegalStateException("Couldn't get message after waiting for " + waitTimeout + " seconds.");
         }
         return frame;
+    }
+
+    public void pong(String data) throws Exception {
+        byte[] bytes = data.getBytes();
+        ch.write(new PongWebSocketFrame(ChannelBuffers.copiedBuffer(bytes)));
     }
 
     public String ping(String data) throws Exception {
